@@ -553,40 +553,42 @@ modelcols(t::ContinuousTerm, d::NamedTuple) = copy.(d[t.sym])
 modelcols(t::CategoricalTerm, d::NamedTuple) = t.contrasts[d[t.sym], :]
 
 
-"""
-    reshape_last_to_i(i::Int, a)
-
-Reshape `a` so that its last dimension moves to dimension `i` (+1 if `a` is an
-`AbstractMatrix`).
-"""
-reshape_last_to_i(i, a) = a
-reshape_last_to_i(i, a::AbstractVector) = reshape(a, ones(Int, i-1)..., :)
-reshape_last_to_i(i, a::AbstractMatrix) = reshape(a, size(a,1), ones(Int, i-1)..., :)
-
-# an "inside out" kronecker-like product based on broadcasting reshaped arrays
-# for a single row, some will be scalars, others possibly vectors.  for a whole
-# table, some will be vectors, possibly some matrices
-function kron_insideout(op::Function, args...)
-    args = (reshape_last_to_i(i,a) for (i,a) in enumerate(args))
-    out = broadcast(op, args...)
-    # flatten array output to vector
-    out isa AbstractArray ? vec(out) : out
-end
-
-function row_kron_insideout(op::Function, args...)
-    rows = size(args[1], 1)
-    args = (reshape_last_to_i(i,reshape(a, size(a,1), :)) for (i,a) in enumerate(args))
-    # args = (reshape(a, size(a,1), ones(Int, i-1)..., :) for (i,a) in enumerate(args))
-    reshape(broadcast(op, args...), rows, :)
-end
-
-# two options here: either special-case ColumnTable (named tuple of vectors)
-# vs. vanilla NamedTuple, or reshape and use normal broadcasting
+# An "inside out" Kronecker-like product, with the first factor varying fastest.
+# For a single row, factors are scalars or vectors; for a whole table, they are
+# vectors or matrices with one row per observation. The product is built one
+# factor at a time, so each step compiles for two arguments whatever the number
+# of factors: a new interaction degree does not trigger new compilation.
 modelcols(t::InteractionTerm, d::NamedTuple) =
-    kron_insideout(*, (modelcols(term, d) for term in t.terms)...)
+    kron_insideout_factors(*, Any[modelcols(term, d) for term in t.terms])
 
-function modelcols(t::InteractionTerm, d::ColumnTable)
-    row_kron_insideout(*, (modelcols(term, d) for term in t.terms)...)
+modelcols(t::InteractionTerm, d::ColumnTable) =
+    row_kron_insideout_factors(*, Any[modelcols(term, d) for term in t.terms])
+
+kron_insideout(op::Function, args...) = kron_insideout_factors(op, args)
+row_kron_insideout(op::Function, args...) = row_kron_insideout_factors(op, args)
+
+function kron_insideout_factors(op::Function, factors)
+    out = first(factors)
+    length(factors) == 1 && return out isa AbstractArray ? vec(op.(out)) : op(out)
+    for x in Iterators.drop(factors, 1)
+        if out isa AbstractArray || x isa AbstractArray
+            out = vec(op.(vectorize(out), permutedims(vectorize(x))))
+        else
+            out = op(out, x)
+        end
+    end
+    return out
+end
+
+function row_kron_insideout_factors(op::Function, factors)
+    x1 = first(factors)
+    out = reshape(x1, size(x1, 1), :)
+    length(factors) == 1 && return op.(out)
+    for x in Iterators.drop(factors, 1)
+        # out is rows × p and x is rows × q: the result is rows × (p * q)
+        out = reshape(op.(out, reshape(x, size(x, 1), 1, :)), size(out, 1), :)
+    end
+    return out
 end
 
 modelcols(t::InterceptTerm{true}, d::NamedTuple) = ones(size(first(d)))
@@ -625,7 +627,7 @@ StatsAPI.coefnames(t::FunctionTerm) = string(t.exorig)
 StatsAPI.coefnames(ts::AbstractVector{<:AbstractTerm}) = mapreduce(coefnames, vcat, ts; init=String[])
 StatsAPI.coefnames(t::MatrixTerm) = mapreduce(coefnames, vcat, t.terms; init = String[])
 StatsAPI.coefnames(t::InteractionTerm) =
-    kron_insideout((args...) -> join(args, " & "), vectorize.(coefnames.(t.terms))...)
+    kron_insideout_factors((args...) -> join(args, " & "), Any[vectorize(coefnames(tt)) for tt in t.terms])
 
 """
     termnames(model::StatisticalModel)
@@ -694,7 +696,7 @@ termnames(ts::AbstractVector{<:AbstractTerm}) = mapreduce(termnames, vcat, ts; i
 # termnames(MatrixTerm(term(:a)))
 termnames(t::MatrixTerm) = mapreduce(termnames, vcat, t.terms; init=String[])
 termnames(t::InteractionTerm) =
-    only(kron_insideout((args...) -> join(args, " & "), vectorize.(termnames.(t.terms))...))
+    only(kron_insideout_factors((args...) -> join(args, " & "), Any[vectorize(termnames(tt)) for tt in t.terms]))
 
 ################################################################################
 # old Terms features:
