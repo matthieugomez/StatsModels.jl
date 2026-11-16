@@ -487,7 +487,7 @@ end
 apply_schema(t, schema::FullRank, Mod::Type, context::AbstractTerm) = t
 # when there's a context, check to see if any of the terms already seen would be
 # aliased by this term _if_ it were full rank.
-function apply_schema(t::CategoricalTerm, schema::FullRank, Mod::Type, context::AbstractTerm)
+function apply_schema(t::CategoricalTerm, schema::FullRank, Mod::Type, @nospecialize(context::AbstractTerm))
     aliased = drop_term(context, t)
     @debug "$t in context of $context: aliases $aliased\n  seen already: $(schema.already)"
     for seen in schema.already
@@ -532,7 +532,8 @@ termsyms(t::Union{Term, CategoricalTerm, ContinuousTerm}) = Set([t.sym])
 termsyms(t::InteractionTerm) = mapreduce(termsyms, union, t.terms)
 termsyms(t::FunctionTerm) = Set([t.exorig])
 
-symequal(t1::AbstractTerm, t2::AbstractTerm) = issetequal(termsyms(t1), termsyms(t2))
+symequal(@nospecialize(t1::AbstractTerm), @nospecialize(t2::AbstractTerm)) =
+    issetequal(termsyms(t1), termsyms(t2))
 
 
 """

@@ -449,14 +449,27 @@ Base.:*(a::TermOrTerms, b::TermOrTerms) = a + b + a&b
 
 # the rhs of a formula built with `~` is always a Vector{AbstractTerm}, sorted
 # by degree; a lone term is wrapped in a vector
-cleanup(terms::AbstractVector{<:AbstractTerm}) =
-    sort!(unique!(AbstractTerm[terms;]), by=degree)
+# (written as loops over AbstractTerm: `unique!` and `sort!(by=degree)` compile
+# once per pair of term types)
+function cleanup(terms::AbstractVector{<:AbstractTerm})
+    out = AbstractTerm[]
+    for t in terms
+        t in out || push!(out, t)
+    end
+    return out[sortperm(Float64[degree(t) for t in out])]
+end
 cleanup(t::AbstractTerm) = AbstractTerm[t]
 
 degree(::ConstantTerm) = 0
 degree(::InterceptTerm) = 0
 degree(::AbstractTerm) = 1
-degree(t::InteractionTerm) = mapreduce(degree, +, t.terms)
+function degree(t::InteractionTerm)
+    d = 0
+    for tt in t.terms
+        d += degree(tt)
+    end
+    return d
+end
 # dirty hack, move to MixedModels.jl
 degree(::FunctionTerm{typeof(|)}) = Inf
 
@@ -585,8 +598,20 @@ function row_kron_insideout_factors(op::Function, factors)
     out = reshape(x1, size(x1, 1), :)
     length(factors) == 1 && return op.(out)
     for x in Iterators.drop(factors, 1)
-        # out is rows × p and x is rows × q: the result is rows × (p * q)
-        out = reshape(op.(out, reshape(x, size(x, 1), 1, :)), size(out, 1), :)
+        out = row_kron(op, out, reshape(x, size(x, 1), :))
+    end
+    return out
+end
+
+# One step of the product, as a function barrier: a is rows × p and b is
+# rows × q; the result is rows × (p * q), with a varying fastest. An explicit
+# loop avoids compiling 3-dimensional broadcasting.
+function row_kron(op, a::AbstractMatrix, b::AbstractMatrix)
+    n, p = size(a)
+    q = size(b, 2)
+    out = Matrix{Base.promote_op(op, eltype(a), eltype(b))}(undef, n, p * q)
+    @inbounds for j in 1:q, i in 1:p, r in 1:n
+        out[r, (j - 1) * p + i] = op(a[r, i], b[r, j])
     end
     return out
 end
@@ -599,7 +624,14 @@ modelcols(t::FormulaTerm, d::NamedTuple) = (modelcols(t.lhs,d), modelcols(t.rhs,
 function modelcols(t::MatrixTerm, d::ColumnTable)
     # an empty MatrixTerm (e.g. from an empty rhs) has no columns, like InterceptTerm{false}
     isempty(t.terms) && return Matrix{Float64}(undef, size(first(d), 1), 0)
-    mat = reduce(hcat, [modelcols(tt, d) for tt in t.terms])
+    blocks = [modelcols(tt, d) for tt in t.terms]
+    # a single typed hcat for dense blocks: on a mix of vectors and matrices,
+    # reduce(hcat, ...) falls back to pairwise hcat, compiled per pair of types
+    if all(b -> b isa Array && ndims(b) <= 2, blocks)
+        mat = reduce(hcat, AbstractVecOrMat[b for b in blocks])
+    else
+        mat = reduce(hcat, blocks)
+    end
     reshape(mat, size(mat, 1), :)
 end
 
